@@ -45,12 +45,12 @@ def train_gp(train_x, train_y, use_ard, num_steps, hypers={}):
     assert train_x.shape[0] == train_y.shape[0]
 
     # Create hyper parameter bounds
-    noise_constraint = Interval(5e-4, 0.2)
+    noise_constraint = Interval(1e-10, 0.2)
     if use_ard:
-        lengthscale_constraint = Interval(0.005, 2.0)
+        lengthscale_constraint = Interval(0.005, 5)
     else:
         lengthscale_constraint = Interval(0.005, math.sqrt(train_x.shape[1]))  # [0.005, sqrt(dim)]
-    outputscale_constraint = Interval(0.05, 20.0)
+    outputscale_constraint = Interval(0.05, 200.0)  # Reduce lower bound to 0.005?
 
     # Create models
     likelihood = GaussianLikelihood(noise_constraint=noise_constraint).to(device=train_x.device, dtype=train_y.dtype)
@@ -78,19 +78,36 @@ def train_gp(train_x, train_y, use_ard, num_steps, hypers={}):
         hypers = {}
         hypers["covar_module.outputscale"] = 1.0
         hypers["covar_module.base_kernel.lengthscale"] = 0.5
-        hypers["likelihood.noise"] = 0.005
+        hypers["likelihood.noise"] = 0.05
         model.initialize(**hypers)
 
     # Use the adam optimizer
-    optimizer = torch.optim.Adam([{"params": model.parameters()}], lr=0.1)
+    # optimizer = torch.optim.Adam([{"params": model.parameters()}], lr=1e-1)
+    optimizer = torch.optim.Adam([{"params": model.parameters()}], lr=1e-1)
+    # optimizer = torch.optim.AdamW([{"params": model.parameters()}], lr=0.1, weight_decay=1e-4)
 
-    for _ in range(num_steps):
+    for i in range(num_steps):
         optimizer.zero_grad()
         output = model(train_x)
         loss = -mll(output, train_y)
+        if i == 0:
+            print('Initial loss: ', loss.item())
+        elif i == num_steps - 1:
+            print('Final loss: ', loss.item())
         loss.backward()
+        
+        # print('Iter: ', i + 1, ', Loss: ', loss.item())
+        # print('outputscale: ', model.covar_module.outputscale.item())
+        # print('lengthscales: ', model.covar_module.base_kernel.lengthscale, ', noise: ', model.likelihood.noise.item())
         optimizer.step()
 
+    l = model.covar_module.base_kernel.lengthscale.detach().cpu().numpy()
+    # print(l)
+    print("ℓ min, max:",   np.min(l), np.max(l))
+    print("σ²:",  model.covar_module.outputscale.detach().cpu())
+    print("η²:",  model.likelihood.noise_covar.noise.detach().cpu())
+
+    # exit()
     # Switch to eval mode
     model.eval()
     likelihood.eval()

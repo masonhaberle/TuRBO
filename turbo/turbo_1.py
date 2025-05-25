@@ -158,7 +158,7 @@ class Turbo1:
         # Standardize function values.
         mu, sigma = np.median(fX), fX.std()
         sigma = 1.0 if sigma < 1e-6 else sigma
-        fX = (deepcopy(fX) - mu) / sigma
+        fX_copy = (deepcopy(fX) - mu) / sigma
 
         # Figure out what device we are running on
         if len(X) < self.min_cuda:
@@ -169,7 +169,7 @@ class Turbo1:
         # We use CG + Lanczos for training if we have enough data
         with gpytorch.settings.max_cholesky_size(self.max_cholesky_size):
             X_torch = torch.tensor(X).to(device=device, dtype=dtype)
-            y_torch = torch.tensor(fX).to(device=device, dtype=dtype)
+            y_torch = torch.tensor(fX_copy).to(device=device, dtype=dtype)
             gp = train_gp(
                 train_x=X_torch, train_y=y_torch, use_ard=self.use_ard, num_steps=n_training_steps, hypers=hypers
             )
@@ -178,12 +178,19 @@ class Turbo1:
             hypers = gp.state_dict()
 
         # Create the trust region boundaries
-        x_center = X[fX.argmin().item(), :][None, :]
+        x_center = X[fX_copy.argmin().item(), :][None, :]
         weights = gp.covar_module.base_kernel.lengthscale.cpu().detach().numpy().ravel()
+        # print('weights : ', weights)
         weights = weights / weights.mean()  # This will make the next line more stable
+        # print('weights : ', weights)
         weights = weights / np.prod(np.power(weights, 1.0 / len(weights)))  # We now have weights.prod() = 1
+        # print('weights : ', weights)
         lb = np.clip(x_center - weights * length / 2.0, 0.0, 1.0)
         ub = np.clip(x_center + weights * length / 2.0, 0.0, 1.0)
+        # print('np.max(lb) : ', np.max(lb))
+        # print('np.max(ub) : ', np.max(ub))
+        # print('np.min(lb) : ', np.min(lb))
+        # print('np.min(ub) : ', np.min(ub))
 
         # Draw a Sobolev sequence in [lb, ub]
         seed = np.random.randint(int(1e6))
@@ -226,12 +233,14 @@ class Turbo1:
     def _select_candidates(self, X_cand, y_cand):
         """Select candidates."""
         X_next = np.ones((self.batch_size, self.dim))
+        y_next = np.zeros((self.batch_size))
         for i in range(self.batch_size):
             # Pick the best point and make sure we never pick it again
             indbest = np.argmin(y_cand[:, i])
             X_next[i, :] = deepcopy(X_cand[indbest, :])
+            y_next[i] = deepcopy(y_cand[indbest, i])
             y_cand[indbest, :] = np.inf
-        return X_next
+        return X_next, y_next
 
     def optimize(self):
         """Run the full optimization process."""
@@ -247,6 +256,7 @@ class Turbo1:
             # Generate and evalute initial design points
             X_init = latin_hypercube(self.n_init, self.dim)
             X_init = from_unit_cube(X_init, self.lb, self.ub)
+            print('X_init : ', X_init, np.shape(X_init))
             fX_init = np.array([[self.f(x)] for x in X_init])
 
             # Update budget and set as initial data for this TR
@@ -275,13 +285,80 @@ class Turbo1:
                 X_cand, y_cand, _ = self._create_candidates(
                     X, fX, length=self.length, n_training_steps=self.n_training_steps, hypers={}
                 )
-                X_next = self._select_candidates(X_cand, y_cand)
+                # X_cand_unwarped = from_unit_cube(X_cand, self.lb, self.ub)
+                # print('y_cand : ', y_cand.shape)
+                # std  = np.var(y_cand, axis=-1)
+                # mean = np.mean(y_cand, axis=-1)
+                # print('std : ', std)
+                # print('mean : ', mean)
+                # fX_next = np.array([[self.f(x)] for x in X_cand_unwarped])
+
+                # from matplotlib import pyplot as plt
+                # with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                #     # Initialize plot
+                #     f, ax = plt.subplots(1, 1, figsize=(4, 3))
+
+                #     # Get upper and lower confidence bounds
+                #     # lower, upper = y_cand.confidence_region()
+                #     # Plot training data as black stars
+                #     # Plot predictive means as blue line
+                #     # ax.plot(X_cand[:, 0], y_cand, 'bo')
+                #     ax.plot(X_cand_unwarped[:, 0], np.ravel(fX_next), 'k*')
+                #     plt.fill_between(X_cand_unwarped[:, 0], mean-2*std, mean+2*std, alpha=0.4)
+                #     # Shade between the lower and upper confidence bounds
+                #     # ax.fill_between(X_cand.numpy()[:, 0], lower.numpy(), upper.numpy(), alpha=0.5)
+                #     # ax.set_ylim([-3, 3])
+                #     ax.legend(['Prediction', 'Observation'])
+                #     plt.show()
+
+                # exit()
+                # fX_next_cand = np.array([[self.f(x)] for x in X_cand])
+                # print('fX_next_cand : ', np.shape(fX_next_cand))
+                # print('X_cand : ', np.shape(X_cand))
+                # print('y_cand : ', np.shape(y_cand))
+                # exit()
+                # X_next, _ = self._select_candidates(X_cand, fX_next_cand)
+
+                X_next, y_next = self._select_candidates(X_cand, y_cand)
+
+                # X_plot = X_next.copy()
 
                 # Undo the warping
                 X_next = from_unit_cube(X_next, self.lb, self.ub)
 
+
+                
+                # print('X_next : ', np.shape(X_next))
+                # print('X.shape : ', np.shape(X))
+
                 # Evaluate batch
                 fX_next = np.array([[self.f(x)] for x in X_next])
+                # print('fX_next : ', np.shape(fX_next))
+                                # Test accuracy of y_cand
+                # from matplotlib import pyplot as plt
+
+                # # Test points are regularly spaced along [0,1]
+                # # Make predictions by feeding model through likelihood
+                # # print(np.shape(X), np.shape(fX_next))
+                # # print(np.shape(y_next), np.shape(X_next))
+
+
+                # with torch.no_grad(), gpytorch.settings.fast_pred_var():
+                #     # Initialize plot
+                #     f, ax = plt.subplots(1, 1, figsize=(4, 3))
+
+                #     # Get upper and lower confidence bounds
+                #     # lower, upper = y_cand.confidence_region()
+                #     # Plot training data as black stars
+                #     # Plot predictive means as blue line
+                #     ax.plot(X_plot[:, 0], y_next, 'bo')
+                #     ax.plot(X_plot[:, 0], np.ravel(fX_next), 'k*')
+                #     plt.fill_between(X_plot[:, 0], mean-2*std, mean+2*std, alpha=0.2)
+                #     # Shade between the lower and upper confidence bounds
+                #     # ax.fill_between(X_cand.numpy()[:, 0], lower.numpy(), upper.numpy(), alpha=0.5)
+                #     # ax.set_ylim([-3, 3])
+                #     ax.legend(['Prediction', 'Observation'])
+                #     plt.show()
 
                 # Update trust region
                 self._adjust_length(fX_next)
