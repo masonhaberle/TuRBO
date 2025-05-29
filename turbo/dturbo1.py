@@ -17,12 +17,12 @@ import gpytorch
 import numpy as np
 import torch
 from torch.quasirandom import SobolEngine
+from torch.utils.data import TensorDataset, DataLoader
 
-from .gp import train_gp
 from .utils import from_unit_cube, latin_hypercube, to_unit_cube
+from .dsvgp import train_gp as train_gp_derivative
 
-
-class Turbo1:
+class DTurbo1:
     """The TuRBO-1 algorithm.
 
     Parameters
@@ -36,6 +36,8 @@ class Turbo1:
     verbose : If you want to print information about the optimization progress, bool.
     use_ard : If you want to use ARD for the GP kernel.
     max_cholesky_size : Largest number of training points where we use Cholesky, int
+    num_inducing : number of inducing points
+    num_directions :  number of inducing directions per point
     n_training_steps : Number of training steps for learning the GP hypers, int
     min_cuda : We use float64 on the CPU if we have this or fewer datapoints
     device : Device to use for GP fitting ("cpu" or "cuda")
@@ -50,16 +52,19 @@ class Turbo1:
     def __init__(
         self,
         f,
+        df,
         lb,
         ub,
         n_init,
         max_evals,
-        batch_size=1,
-        scale=1.0,
+        batch_size=10,
         verbose=True,
         use_ard=True,
         max_cholesky_size=2000,
-        n_training_steps=50,
+        num_inducing=500,
+        num_directions=1,
+        n_training_steps=150,
+        minibatch_size=20,
         min_cuda=1024,
         device="cpu",
         dtype="float64",
@@ -71,7 +76,7 @@ class Turbo1:
         assert np.all(ub > lb)
         assert max_evals > 0 and isinstance(max_evals, int)
         assert n_init > 0 and isinstance(n_init, int)
-        assert batch_size > 0 and isinstance(batch_size, int)
+        assert batch_size > 0 and isinstance(batch_size, int) 
         assert isinstance(verbose, bool) and isinstance(use_ard, bool)
         assert max_cholesky_size >= 0 and isinstance(batch_size, int)
         assert n_training_steps >= 30 and isinstance(n_training_steps, int)
@@ -83,9 +88,11 @@ class Turbo1:
 
         # Save function information
         self.f = f
+        self.df = df
         self.dim = len(lb)
         self.lb = lb
         self.ub = ub
+
         # Settings
         self.n_init = n_init
         self.max_evals = max_evals
@@ -93,7 +100,15 @@ class Turbo1:
         self.verbose = verbose
         self.use_ard = use_ard
         self.max_cholesky_size = max_cholesky_size
-        self.n_training_steps = n_training_steps
+
+        # DSVGP settings
+        self.num_inducing=num_inducing
+        self.num_directions=num_directions
+        self.n_training_steps=n_training_steps
+        self.minibatch_size=minibatch_size
+        self.lr_hypers=0.01 # LR, 0.01 or 0.1
+        self.lr_sched=None  # No LR schedule
+        self.mll_type="PLL" # PPGPR
 
         # Hyperparameters
         self.mean = np.zeros((0, 1))
@@ -102,19 +117,19 @@ class Turbo1:
         self.lengthscales = np.zeros((0, self.dim)) if self.use_ard else np.zeros((0, 1))
 
         # Tolerances and counters
-        self.n_cand = min(100 * self.dim, 5000)  
+        self.n_cand = min(100 * self.dim, 500)
         self.failtol = np.ceil(np.max([4.0 / batch_size, self.dim / batch_size]))
         self.succtol = 3
         self.n_evals = 0
 
         # Trust region sizes
         self.length_min = 0.5 ** 7
-        self.length_max = 1.6
+        self.length_max = 1.6 
         self.length_init = 0.8
 
         # Save the full history
         self.X = np.zeros((0, self.dim))
-        self.fX = np.zeros((0, 1))
+        self.fX = np.zeros((0, self.dim + 1))
 
         # Device and dtype for GPyTorch
         self.min_cuda = min_cuda
@@ -127,16 +142,61 @@ class Turbo1:
         # Initialize parameters
         self._restart()
 
-        if self.verbose:
-            print(f"Initial trust region: length_init={self.length_init}, length_min={self.length_min}, length_max={self.length_max}")
-            sys.stdout.flush()
+    def train_gp(self,train_x, train_y):
+        """make a trainable model for DTuRBO
+        Wraps DSVGP training module
+        Expects train_x on unit cube and train_y standardized
+        """
+        train_x = train_x.float()
+        train_y = train_y.float()
+        dataset = TensorDataset(train_x,train_y)
 
-        # Shrinking parameters
-        self.no_improve_count = 0
-        self.shrink_patience = 20  # Number of iterations to wait before shrinking
-        self.shrink_factor = 0.5   # Fraction to shrink the box by
-        self.shrink_threshold = 0.1  # Minimum improvement to reset counter
-        self.last_best_f = np.inf
+        # train
+        model,likelihood = train_gp_derivative(dataset,
+                            num_inducing=self.num_inducing,
+                            num_directions=self.num_directions,
+                            minibatch_size = self.minibatch_size,
+                            minibatch_dim = self.num_directions,
+                            num_epochs =self.n_training_steps, 
+                            learning_rate_hypers=self.lr_hypers,
+                            lr_sched=self.lr_sched,
+                            mll_type=self.mll_type,
+                            verbose=self.verbose,
+                            )
+        # number type is important
+        return model.double(),likelihood.double()
+    
+    def sample_from_gp(self,model,likelihood,X_cand,n_samples):
+        """Sample from the GP model
+        X_cand: 2d torch tensor, points to sample at
+        n_samples: int, number of samples to take per point in X_cand
+        """
+        model.eval()
+        likelihood.eval()
+    
+        # ensure correct type
+        model = model.float()
+        likelihood = likelihood.float()
+        X_cand = X_cand.float()
+        
+        n,dim = X_cand.shape
+        kwargs = {}
+        derivative_directions = torch.eye(dim)[:dim] # predict all partial derivs
+        derivative_directions = derivative_directions.repeat(n,1)
+        kwargs['derivative_directions'] = derivative_directions.to(X_cand.device).float()
+
+        batch_size = 50  # Set batch size for candidate evaluation
+        y_cand_list = []
+        for i in range(0, n, batch_size):
+            X_batch = X_cand[i:i+batch_size]
+            d_batch = torch.eye(dim)[:dim].repeat(X_batch.shape[0],1).to(X_cand.device).float()
+            batch_kwargs = {'derivative_directions': d_batch}
+            preds = likelihood(model(X_batch, **batch_kwargs))
+            y_batch = preds.sample(torch.Size([n_samples]))  # shape (n_samples, batch_size*(dim+1))
+            y_batch = y_batch[:,::dim+1].t()  # shape (batch_size, n_samples)
+            y_cand_list.append(y_batch.cpu())
+        y_cand = torch.cat(y_cand_list, dim=0)
+        return y_cand
 
     def _restart(self):
         self._X = []
@@ -146,8 +206,7 @@ class Turbo1:
         self.length = self.length_init
 
     def _adjust_length(self, fX_next):
-        prev_length = self.length
-        if np.min(fX_next) < np.min(self._fX) - 1e-3 * math.fabs(np.min(self._fX)):
+        if np.min(fX_next) < np.min(self._fX[:,0]) - 1e-3 * math.fabs(np.min(self._fX[:,0])):
             self.succcount += 1
             self.failcount = 0
         else:
@@ -156,27 +215,24 @@ class Turbo1:
 
         if self.succcount == self.succtol:  # Expand trust region
             self.length = min([2.0 * self.length, self.length_max])
-            if self.verbose:
-                print(f"[TR EXPAND] Trust region expanded: {prev_length} -> {self.length}")
-                sys.stdout.flush()
             self.succcount = 0
         elif self.failcount == self.failtol:  # Shrink trust region
             self.length /= 2.0
-            if self.verbose:
-                print(f"[TR CONTRACT] Trust region contracted: {prev_length} -> {self.length}")
-                sys.stdout.flush()
             self.failcount = 0
 
     def _create_candidates(self, X, fX, length, n_training_steps, hypers):
         """Generate candidates assuming X has been scaled to [0,1]^d."""
         # Pick the center as the point with the smallest function values
         # NOTE: This may not be robust to noise, in which case the posterior mean of the GP can be used instead
-        assert X.min() >= 0.0 and X.max() <= 1.0
+        #assert X.min() >= 0.0 and X.max() <= 1.0   # MP: turned off b/c model improv
 
         # Standardize function values.
-        mu, sigma = np.median(fX), fX.std()
-        sigma = 1.0 if sigma < 1e-6 else sigma
-        fX_copy = (deepcopy(fX) - mu) / sigma
+        mu, sigma = np.median(fX, axis=0)[0], fX.std(axis=0)[0]
+        fX[:,0] = (deepcopy(fX[:,0]) - mu) / sigma
+        # Standardize gradients
+        fX[:,1:] = deepcopy(fX[:,1:]) / sigma
+        # do from_unit_cube mapping on gradients (b/c X got mapped to unit cube)
+        fX[:,1:] = deepcopy(fX[:,1:]) * (self.ub-self.lb)
 
         # Figure out what device we are running on
         if len(X) < self.min_cuda:
@@ -187,43 +243,20 @@ class Turbo1:
         # We use CG + Lanczos for training if we have enough data
         with gpytorch.settings.max_cholesky_size(self.max_cholesky_size):
             X_torch = torch.tensor(X).to(device=device, dtype=dtype)
-            y_torch = torch.tensor(fX_copy).to(device=device, dtype=dtype)
-            gp = train_gp(
-                train_x=X_torch, train_y=y_torch, 
-                use_ard=self.use_ard, num_steps=n_training_steps, hypers=hypers
-            )
+            y_torch = torch.tensor(fX).to(device=device, dtype=dtype)
+            gp,likelihood = self.train_gp(
+                train_x=X_torch, train_y=y_torch)
 
             # Save state dict
             hypers = gp.state_dict()
 
-        # GP accuracy check (train MSE, lengthscales, noise)
-        # if self.verbose:
-        #     with torch.no_grad():
-        #         y_pred = gp(X_torch).mean.cpu().numpy().ravel()
-        #         train_mse = np.mean((y_pred - fX_copy.ravel()) ** 2)
-        #         l = gp.covar_module.base_kernel.lengthscale.detach().cpu().numpy()
-        #         noise = gp.likelihood.noise.item()
-        #         print(f"[GP CHECK] Train MSE: {train_mse:.4g}, Lengthscales: {l}, Noise: {noise:.4g}")
-        #         if train_mse < 1e-6:
-        #             print("[GP CHECK] Warning: GP may be overfitting (very low train error).")
-        #         elif train_mse > 1e-2:
-        #             print("[GP CHECK] Warning: GP may be underfitting (high train error).")
-        #         else:
-        #             print("[GP CHECK] GP fit appears reasonable.")
-        #         sys.stdout.flush()
-
         # Create the trust region boundaries
-        x_center = X[fX_copy.argmin().item(), :][None, :]
+        x_center = X[fX[:, 0].argmin().item(), :][None, :]
         weights = gp.covar_module.base_kernel.lengthscale.cpu().detach().numpy().ravel()
         weights = weights / weights.mean()  # This will make the next line more stable
-        # weights = weights / np.prod(np.power(weights, 1.0 / len(weights)))  # We now have weights.prod() = 1
+        weights = weights / np.prod(np.power(weights, 1.0 / len(weights)))  # We now have weights.prod() = 1
         lb = np.clip(x_center - weights * length / 2.0, 0.0, 1.0)
         ub = np.clip(x_center + weights * length / 2.0, 0.0, 1.0)
-        # if self.verbose:
-        #     print(f"[TR BOUNDS] length={length}, weights={weights}, width={ub-lb}")
-        #     # print("lb : ", lb)
-        #     # print("ub : ", ub)
-        #     sys.stdout.flush()
 
         # Draw a Sobolev sequence in [lb, ub]
         seed = np.random.randint(int(1e6))
@@ -253,33 +286,35 @@ class Turbo1:
         # We use Lanczos for sampling if we have enough data
         with torch.no_grad(), gpytorch.settings.max_cholesky_size(self.max_cholesky_size):
             X_cand_torch = torch.tensor(X_cand).to(device=device, dtype=dtype)
-            y_cand = gp.likelihood(gp(X_cand_torch)).sample(torch.Size([self.batch_size])).t().cpu().detach().numpy()
+            # predict function values (self.n_cand, self.batch_size)
+            y_cand = self.sample_from_gp(gp,likelihood,X_cand_torch,self.batch_size).cpu().detach().numpy()
 
         # Remove the torch variables
         del X_torch, y_torch, X_cand_torch, gp
 
-        # De-standardize the sampled values
+        # De-standardize the sampled function values
         y_cand = mu + sigma * y_cand
 
-        return X_cand, y_cand, hypers
+        return X_cand, y_cand, x_center
 
     def _select_candidates(self, X_cand, y_cand):
         """Select candidates."""
         X_next = np.ones((self.batch_size, self.dim))
-        y_next = np.zeros((self.batch_size))
+        y_next = np.ones(self.batch_size)
         for i in range(self.batch_size):
             # Pick the best point and make sure we never pick it again
             indbest = np.argmin(y_cand[:, i])
             X_next[i, :] = deepcopy(X_cand[indbest, :])
-            y_next[i] = deepcopy(y_cand[indbest, i])
+            y_next[i] = y_cand[indbest,i]
             y_cand[indbest, :] = np.inf
-        return X_next, y_next
+        return X_next,y_next
+
 
     def optimize(self):
         """Run the full optimization process."""
         while self.n_evals < self.max_evals:
             if len(self._fX) > 0 and self.verbose:
-                n_evals, fbest = self.n_evals, self._fX.min()
+                n_evals, fbest = self.n_evals, self._fX[:, 0].min()
                 print(f"{n_evals}) Restarting with fbest = {fbest:.4}")
                 sys.stdout.flush()
 
@@ -289,7 +324,9 @@ class Turbo1:
             # Generate and evalute initial design points
             X_init = latin_hypercube(self.n_init, self.dim)
             X_init = from_unit_cube(X_init, self.lb, self.ub)
-            fX_init = np.array([[self.f(x)] for x in X_init])
+            fX_init = np.vstack([self.f(x) for x in X_init])
+            dX_init = np.vstack([self.df(x) for x in X_init])
+            fX_init = np.hstack([fX_init, dX_init])
 
             # Update budget and set as initial data for this TR
             self.n_evals += self.n_init
@@ -301,13 +338,9 @@ class Turbo1:
             self.fX = np.vstack((self.fX, deepcopy(fX_init)))
 
             if self.verbose:
-                fbest = self._fX.min()
+                fbest = self._fX[:, 0].min()
                 print(f"Starting from fbest = {fbest:.4}")
                 sys.stdout.flush()
-
-            # Initialize last_best_f for shrinking logic
-            self.last_best_f = self._fX.min()
-            self.no_improve_count = 0
 
             # Thompson sample to get next suggestions
             while self.n_evals < self.max_evals and self.length >= self.length_min:
@@ -315,23 +348,27 @@ class Turbo1:
                 X = to_unit_cube(deepcopy(self._X), self.lb, self.ub)
 
                 # Standardize values
-                fX = deepcopy(self._fX).ravel()
+                fX = deepcopy(self._fX)
 
                 # Create th next batch
-                X_cand, y_cand, _ = self._create_candidates(
+                X_cand, y_cand, x_center = self._create_candidates(
                     X, fX, length=self.length, n_training_steps=self.n_training_steps, hypers={}
                 )
-
-                X_next, y_next = self._select_candidates(X_cand, y_cand)
+                X_next,y_next = self._select_candidates(X_cand, y_cand)
 
                 # Undo the warping
                 X_next = from_unit_cube(X_next, self.lb, self.ub)
 
                 # Evaluate batch
-                fX_next = np.array([[self.f(x)] for x in X_next])
+                fX_next = np.vstack([self.f(x) for x in X_next])
+                dX_next = np.vstack([self.df(x) for x in X_next])
+                fX_next = np.hstack([fX_next, dX_next])
 
                 # Expand the GLOBAL trust region bounds if any X_next is 
                 # at/near the bounds
+                # This is NOT in the original TuRBO paper but allows the algorithm
+                # to adapt to potentially poor initialization of the global 
+                # trust region bounds.
                 expand_threshold = 1e-4 * (self.ub - self.lb)  # 1e-2 to be loose
                 expand_amount = 0.1 * (self.ub - self.lb)
                 expanded = np.zeros(self.dim, dtype=bool)
@@ -349,16 +386,16 @@ class Turbo1:
                             print(f"[GLOBAL BOUND] Expanded lower bound in dim {d} to {self.lb[d]}")
                             sys.stdout.flush()
 
-                # Update trust region
-                self._adjust_length(fX_next)
+                # Update trust region (based only on function values)
+                self._adjust_length(fX_next[:,0])
 
                 # Update budget and append data
                 self.n_evals += self.batch_size
                 self._X = np.vstack((self._X, X_next))
                 self._fX = np.vstack((self._fX, fX_next))
 
-                if self.verbose and fX_next.min() < self.fX.min():
-                    n_evals, fbest = self.n_evals, fX_next.min()
+                if self.verbose and fX_next[:, 0].min() < self.fX[:, 0].min():
+                    n_evals, fbest = self.n_evals, fX_next[:, 0].min()
                     print(f"{n_evals}) New best: {fbest:.4}")
                     sys.stdout.flush()
 
@@ -366,24 +403,4 @@ class Turbo1:
                 self.X = np.vstack((self.X, deepcopy(X_next)))
                 self.fX = np.vstack((self.fX, deepcopy(fX_next)))
 
-                # --- Shrink global bounds if no significant improvement ---
-                current_best_f = self.fX.min()
-                if current_best_f < self.last_best_f - self.shrink_threshold:
-                    self.no_improve_count = 0
-                    self.last_best_f = current_best_f
-                else:
-                    self.no_improve_count += 1
 
-                if self.no_improve_count >= self.shrink_patience:
-                    # Shrink bounds around current best point
-                    best_idx = np.argmin(self.fX)
-                    best_x = self.X[best_idx]
-                    box_size = self.shrink_factor * (self.ub - self.lb)
-                    new_lb = np.maximum(best_x - box_size / 2, self.lb)
-                    new_ub = np.minimum(best_x + box_size / 2, self.ub)
-                    if self.verbose:
-                        print(f"[GLOBAL BOUND] Shrinking bounds around best_x. New lb: {new_lb}, New ub: {new_ub}")
-                        sys.stdout.flush()
-                    self.lb = new_lb
-                    self.ub = new_ub
-                    self.no_improve_count = 0

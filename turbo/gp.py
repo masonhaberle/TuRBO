@@ -45,9 +45,9 @@ def train_gp(train_x, train_y, use_ard, num_steps, hypers={}):
     assert train_x.shape[0] == train_y.shape[0]
 
     # Create hyper parameter bounds
-    noise_constraint = Interval(1e-10, 0.2)
+    noise_constraint = Interval(1e-5, 0.2)
     if use_ard:
-        lengthscale_constraint = Interval(0.005, 5)
+        lengthscale_constraint = Interval(0.001, 5)
     else:
         lengthscale_constraint = Interval(0.005, math.sqrt(train_x.shape[1]))  # [0.005, sqrt(dim)]
     outputscale_constraint = Interval(0.05, 200.0)  # Reduce lower bound to 0.005?
@@ -83,7 +83,7 @@ def train_gp(train_x, train_y, use_ard, num_steps, hypers={}):
 
     # Use the adam optimizer
     # optimizer = torch.optim.Adam([{"params": model.parameters()}], lr=1e-1)
-    optimizer = torch.optim.Adam([{"params": model.parameters()}], lr=1e-1)
+    optimizer = torch.optim.Adam([{"params": model.parameters()}], lr=2e-1)
     # optimizer = torch.optim.AdamW([{"params": model.parameters()}], lr=0.1, weight_decay=1e-4)
 
     for i in range(num_steps):
