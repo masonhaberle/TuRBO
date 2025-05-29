@@ -38,7 +38,7 @@ class GP(ExactGP):
         return MultivariateNormal(mean_x, covar_x)
 
 
-def train_gp(train_x, train_y, use_ard, num_steps, hypers={}):
+def train_gp(train_x, train_y, use_ard, num_steps, initial_lengthscales=None, hypers={}):
     """Fit a GP model where train_x is in [0, 1]^d and train_y is standardized."""
     assert train_x.ndim == 2
     assert train_y.ndim == 1
@@ -46,11 +46,23 @@ def train_gp(train_x, train_y, use_ard, num_steps, hypers={}):
 
     # Create hyper parameter bounds
     noise_constraint = Interval(1e-5, 0.2)
+    output_initialization = 1.0
+    noise_initialization = 0.005
+    lengthscales_initialization = 0.5
     if use_ard:
-        lengthscale_constraint = Interval(0.001, 5)
+        if initial_lengthscales is not None:
+            # Convert to numpy array first, then to torch tensor
+            lengthscales_np = np.array(initial_lengthscales)
+            lengthscales_tensor = torch.from_numpy(lengthscales_np)
+            lengthscales_initialization = lengthscales_tensor
+            lengthscale_constraint = Interval(
+                float(torch.min(lengthscales_tensor)) * 0.1, 
+                float(torch.max(lengthscales_tensor)) * 2.0)
+        else:
+            lengthscale_constraint = Interval(0.001, 5)
     else:
         lengthscale_constraint = Interval(0.005, math.sqrt(train_x.shape[1]))  # [0.005, sqrt(dim)]
-    outputscale_constraint = Interval(0.05, 200.0)  # Reduce lower bound to 0.005?
+    outputscale_constraint = Interval(0.05, 20.0)  # Reduce lower bound to 0.005?
 
     # Create models
     likelihood = GaussianLikelihood(noise_constraint=noise_constraint).to(device=train_x.device, dtype=train_y.dtype)
@@ -76,9 +88,9 @@ def train_gp(train_x, train_y, use_ard, num_steps, hypers={}):
         model.load_state_dict(hypers)
     else:
         hypers = {}
-        hypers["covar_module.outputscale"] = 1.0
-        hypers["covar_module.base_kernel.lengthscale"] = 0.5
-        hypers["likelihood.noise"] = 0.05
+        hypers["covar_module.outputscale"] = output_initialization
+        hypers["covar_module.base_kernel.lengthscale"] = lengthscales_initialization
+        hypers["likelihood.noise"] = noise_initialization
         model.initialize(**hypers)
 
     # Use the adam optimizer
@@ -101,11 +113,11 @@ def train_gp(train_x, train_y, use_ard, num_steps, hypers={}):
         # print('lengthscales: ', model.covar_module.base_kernel.lengthscale, ', noise: ', model.likelihood.noise.item())
         optimizer.step()
 
-    l = model.covar_module.base_kernel.lengthscale.detach().cpu().numpy()
+    # l = model.covar_module.base_kernel.lengthscale.detach().cpu().numpy()
     # print(l)
-    print("ℓ min, max:",   np.min(l), np.max(l))
-    print("σ²:",  model.covar_module.outputscale.detach().cpu())
-    print("η²:",  model.likelihood.noise_covar.noise.detach().cpu())
+    # print("ℓ min, max:",   np.min(l), np.max(l))
+    # print("σ²:",  model.covar_module.outputscale.detach().cpu())
+    # print("η²:",  model.likelihood.noise_covar.noise.detach().cpu())
 
     # exit()
     # Switch to eval mode
